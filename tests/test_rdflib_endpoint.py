@@ -267,3 +267,20 @@ CONSTRUCT {
     BIND("First" AS ?first)
     BIND(myfunctions:custom_concat(?first, "last") AS ?concat)
 }"""
+
+
+def test_legacy_functions_are_scoped_to_router_graph():
+    """Legacy `functions` registered on one router must not fire on other graphs.
+
+    RDFLib's CUSTOM_EVALS registry is process-global; SparqlRouter scopes its
+    handler to its own graph via a per-instance key and an ownership guard.
+    """
+    graph_a = Graph()
+    graph_b = Graph()
+    SparqlEndpoint(graph=graph_a, functions={"urn:test:scopedConcat": custom_concat})
+    SparqlEndpoint(graph=graph_b)
+
+    query = 'SELECT ?concat WHERE { BIND(<urn:test:scopedConcat>("a", "b") AS ?concat) }'
+    assert [str(row[0]) for row in graph_a.query(query)] == ["ab", "ba"]
+    # graph_b never registered the function, so it must resolve to nothing
+    assert list(graph_b.query(query)) == []

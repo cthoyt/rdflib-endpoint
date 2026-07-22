@@ -269,3 +269,24 @@ def test_filter_based_list() -> None:
         (URIRef("http://purl.obolibrary.org/obo/CHEBI_2"),),
     ]
     assert list(ds.query(query)) == expected2
+
+
+def test_custom_functions_are_isolated_per_dataset() -> None:
+    """Functions registered on one DatasetExt must not leak into another.
+
+    RDFLib's CUSTOM_EVALS registry is process-global; DatasetExt scopes each
+    function to its owning dataset via an owner guard on ``ctx._dataset``.
+    """
+    ds_a = DatasetExt()
+
+    @ds_a.extension_function()
+    def only_on_a(value: str) -> str:
+        return value.upper()
+
+    ds_b = DatasetExt()
+
+    query = 'SELECT ?o WHERE { BIND(<urn:sparql-function:onlyOnA>("hi") AS ?o) }'
+
+    assert [str(row.o) for row in ds_a.query(query)] == ["HI"]
+    # ds_b never registered the function, so it must resolve to nothing
+    assert [str(row.o) for row in ds_b.query(query)] == []

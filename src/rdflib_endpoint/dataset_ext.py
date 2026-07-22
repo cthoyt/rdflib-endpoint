@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import logging
+import weakref
 from dataclasses import asdict, is_dataclass
-from typing import Any, Callable, Generator
+from typing import Any, Callable, Generator, cast
 
 from rdflib import RDF, Dataset, Graph, Literal, Namespace, URIRef, Variable
 from rdflib.plugins.sparql import CUSTOM_EVALS
@@ -22,6 +24,8 @@ from rdflib.term import Identifier
 from rdflib_endpoint.gen_docs import CustomFunction, generate_docs, snake_to_camel, snake_to_pascal
 
 DEFAULT_NAMESPACE = Namespace("urn:sparql-function:")
+
+logger = logging.getLogger(__name__)
 
 
 def _to_node(value: Any) -> Identifier:
@@ -71,27 +75,57 @@ class DatasetExt(Dataset):
 
     _tmp_graph_uris: set[Identifier]
     _custom_functions: dict[str, CustomFunction]
+    _eval_keys: set[str]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._tmp_graph_uris = set()
         self._custom_functions = {}
+        # Keys this instance owns in RDFLib's process-global CUSTOM_EVALS registry.
+        # Dropped automatically when the instance is garbage collected so the global
+        # registry never leaks or pins dead datasets.
+        self._eval_keys = set()
+        weakref.finalize(self, _unregister_eval_funcs, self._eval_keys)
 
-    def _register_custom_function(
+    def _register_function(
         self,
         func: Callable[..., Any],
         func_type: str,
         namespace: Namespace,
         iri: URIRef,
+        eval_func: Callable[..., Any],
     ) -> None:
-        """Track a decorated function and its metadata for later introspection."""
+        """Register a decorated function with this dataset.
+
+        Tracks the function's metadata for later introspection, and registers its eval
+        function in RDFLib's process-global CUSTOM_EVALS registry scoped to this instance:
+        the key embeds `id(self)` so two datasets never collide, and the function is
+        wrapped in an owner guard so it only fires for queries run against *this* dataset.
+        """
         self._custom_functions[_func_name(func)] = CustomFunction(
             func=func, func_type=func_type, namespace=namespace, iri=iri
         )
+        key = f"{func_type}::{id(self)}::{_func_name(func)}"
+        CUSTOM_EVALS[key] = _owner_guard(weakref.ref(self), _with_filter_support(eval_func))
+        self._eval_keys.add(key)
 
     def get_custom_functions(self) -> list[Callable[..., Any]]:
         """Return custom functions registered via DatasetExt decorators."""
         return [meta.func for meta in self._custom_functions.values()]
+
+    def get_extension_function_iris(self) -> list[URIRef]:
+        """Return the IRIs of functions callable as SPARQL extension functions.
+
+        These are the `extension_function` and `graph_function` decorated functions,
+        i.e. the ones invoked as `<iri>(...)` in a query (used to advertise them in the
+        SPARQL service description). Type and predicate functions are matched by graph
+        pattern, not called by IRI, so they are excluded.
+        """
+        return [
+            meta.iri
+            for meta in self._custom_functions.values()
+            if meta.func_type in ("extension_function", "graph_function")
+        ]
 
     def _register_tmp_graph(self, graph_uri: Identifier) -> None:
         """Register a temporary graph URI for cleanup."""
@@ -142,8 +176,7 @@ class DatasetExt(Dataset):
                     raise ValueError("type_function(use_subject=True) requires at least one function argument")
                 subject_arg_name = arg_names[0]
             for param_name, param in signature.parameters.items():
-                if param_name not in arg_predicates:
-                    arg_predicates[param_name] = namespace[snake_to_camel(param_name)]
+                arg_predicates[param_name] = namespace[snake_to_camel(param_name)]
                 if param.default is not inspect._empty:
                     arg_defaults[param_name] = param.default
 
@@ -199,8 +232,9 @@ class DatasetExt(Dataset):
                     ):
                         output_vars[pred] = obj
 
-                # Get initial bindings from other triples (this chains to other custom evals)
-                initial_bindings = list(evalBGP(ctx, other_triples)) if other_triples else [ctx.solution()]
+                # Get initial bindings from other triples (this chains to other custom evals).
+                # Kept lazy: bindings are consumed one by one, no need to materialize them all.
+                initial_bindings = evalBGP(ctx, other_triples) if other_triples else iter([ctx.solution()])
 
                 # Process our function for each binding
                 for bindings in initial_bindings:
@@ -236,7 +270,7 @@ class DatasetExt(Dataset):
                     try:
                         result = func(**inputs)
                     except Exception as e:
-                        print(f"Error in custom function {_func_name(func)}: {e}")
+                        logger.warning(f"Error in custom function {_func_name(func)}: {e}")
                         continue
                     # Normalize results to list
                     if inspect.isgenerator(result):
@@ -266,9 +300,7 @@ class DatasetExt(Dataset):
                                 new_bindings[output_vars[out_pred]] = _to_node(res)
                         yield FrozenBindings(ctx, new_bindings)
 
-            # Register with RDFLib using function name as key
-            CUSTOM_EVALS[f"type_{_func_name(func)}"] = _with_filter_support(custom_eval_func)
-            self._register_custom_function(func, "type_function", namespace, class_iri)
+            self._register_function(func, "type_function", namespace, class_iri, custom_eval_func)
             return func
 
         return decorator
@@ -307,7 +339,7 @@ class DatasetExt(Dataset):
                 """Evaluate a custom predicate pattern call."""
                 our_triples = [triple for triple in triples if triple[1] == predicate_iri]
                 other_triples = [triple for triple in triples if triple[1] != predicate_iri]
-                initial_bindings = list(evalBGP(ctx, other_triples)) if other_triples else [ctx.solution()]
+                initial_bindings = evalBGP(ctx, other_triples) if other_triples else iter([ctx.solution()])
                 for bindings in initial_bindings:
                     binding_candidates: list[FrozenBindings] = [bindings]
                     for subj, _, obj in our_triples:
@@ -319,7 +351,7 @@ class DatasetExt(Dataset):
                             try:
                                 result = func(_to_python(subj_value))
                             except Exception as exc:
-                                print(f"Error in custom predicate {_func_name(func)}: {exc}")
+                                logger.warning(f"Error in custom predicate {_func_name(func)}: {exc}")
                                 continue
 
                             if inspect.isgenerator(result):
@@ -346,9 +378,7 @@ class DatasetExt(Dataset):
 
                     yield from binding_candidates
 
-            # Register with RDFLib
-            CUSTOM_EVALS[f"predicate_{_func_name(func)}"] = _with_filter_support(custom_eval_func)
-            self._register_custom_function(func, "predicate_function", namespace, predicate_iri)
+            self._register_function(func, "predicate_function", namespace, predicate_iri, custom_eval_func)
             return func
 
         return decorator
@@ -420,8 +450,7 @@ class DatasetExt(Dataset):
                             query_results.append(eval_part.merge({part.var: _to_node(res)}))
                 return query_results
 
-            CUSTOM_EVALS[str(iri_value)] = _with_filter_support(_eval_extension_function)
-            self._register_custom_function(func, "extension_function", namespace, iri_value)
+            self._register_function(func, "extension_function", namespace, iri_value, _eval_extension_function)
             return func
 
         return decorator
@@ -469,15 +498,18 @@ class DatasetExt(Dataset):
                     if not isinstance(added_graph, Graph):
                         raise SPARQLError("graph_function must return an rdflib Graph")
 
-                    graph_in_dataset = self.get_context(graph_uri)
+                    # The owner guard guarantees ctx._dataset is this DatasetExt instance.
+                    # Use it (rather than capturing `self`) so the global registry holds
+                    # no strong reference to the dataset.
+                    dataset = cast("DatasetExt", ctx._dataset)
+                    graph_in_dataset = dataset.get_context(graph_uri)
                     for s, p, o in added_graph:
                         graph_in_dataset.add((s, p, o))
-                    self._register_tmp_graph(graph_uri)
+                    dataset._register_tmp_graph(graph_uri)
                     query_results.append(eval_part.merge({part.var: _to_node(graph_uri)}))
                 return query_results
 
-            CUSTOM_EVALS[str(iri_value)] = _with_filter_support(_eval_graph_function)
-            self._register_custom_function(func, "graph_function", namespace, iri_value)
+            self._register_function(func, "graph_function", namespace, iri_value, _eval_graph_function)
             return func
 
         return decorator
@@ -492,6 +524,39 @@ class DatasetExt(Dataset):
         if not self._custom_functions:
             return ""
         return generate_docs(self._custom_functions, verbose=verbose)
+
+
+def _owner_guard(
+    ds_ref: weakref.ReferenceType[DatasetExt],
+    eval_func: Callable[..., Any],
+) -> Callable[..., Any]:
+    """Wrap an eval function so it only fires for queries run against its owning dataset.
+
+    RDFLib's CUSTOM_EVALS registry is process-global, so without this guard a function
+    registered on one DatasetExt would also be evaluated for queries on every other
+    Dataset in the process. We identify the owner via ``ctx._dataset`` (the dataset the
+    query runs against, preserved across ``clone``/``push``), and raise NotImplementedError
+    (RDFLib's "this part is not mine" signal) for any other dataset. Only a weakref to the
+    owner is held, so the registry never keeps the dataset alive.
+
+    Known limitation: queries using ``FROM``/``FROM NAMED`` build a fresh dataset in
+    RDFLib (``ctx._dataset`` is not the queried DatasetExt), so custom functions are
+    not available in such queries.
+    """
+
+    def guarded(ctx: QueryContext, part: CompValue) -> Any:
+        owner = getattr(ctx, "_dataset", None)
+        if owner is None or owner is not ds_ref():
+            raise NotImplementedError()
+        return eval_func(ctx, part)
+
+    return guarded
+
+
+def _unregister_eval_funcs(keys: set[str]) -> None:
+    """Drop a dataset's keys from the global CUSTOM_EVALS registry (called on GC)."""
+    for key in keys:
+        CUSTOM_EVALS.pop(key, None)
 
 
 def _try_single_equality(expr: Any) -> dict[Variable, Identifier] | None:

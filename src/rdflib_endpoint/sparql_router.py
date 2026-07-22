@@ -5,8 +5,10 @@ import os
 import re
 import textwrap
 import warnings
+import weakref
+from collections import OrderedDict
 from importlib import resources
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from urllib import parse
 
 from fastapi import APIRouter, Query, Request, Response
@@ -33,6 +35,26 @@ from rdflib_endpoint.utils import (
     get_default_content_type,
     parse_accept_header,
 )
+
+
+def _graph_scoped_eval(router_ref: "weakref.ReferenceType[SparqlRouter]") -> Callable[[QueryContext, CompValue], Any]:
+    """Wrap a router's legacy custom-functions eval so it only fires for its own graph.
+
+    RDFLib's CUSTOM_EVALS registry is process-global: without this guard the handler
+    would be evaluated for queries on every graph in the process. NotImplementedError
+    is RDFLib's "this part is not mine" signal.
+    """
+
+    def guarded(ctx: QueryContext, part: CompValue) -> Any:
+        router = router_ref()
+        if router is None:
+            raise NotImplementedError()
+        owner = getattr(ctx, "_dataset", None) or ctx.graph
+        if owner is not router.graph:
+            raise NotImplementedError()
+        return router.eval_custom_functions(ctx, part)
+
+    return guarded
 
 
 class SparqlRouter(APIRouter):
@@ -110,7 +132,17 @@ class SparqlRouter(APIRouter):
         if custom_eval:
             CUSTOM_EVALS["evalCustomFunctions"] = custom_eval
         elif len(self.functions) > 0:
-            CUSTOM_EVALS["evalCustomFunctions"] = self.eval_custom_functions
+            # Register under a per-instance key with a graph-ownership guard: CUSTOM_EVALS
+            # is process-global, so a shared key would let one router clobber another and
+            # let this handler fire for queries on unrelated graphs. Only a weakref to the
+            # router is held, and the key is dropped when the router is garbage collected.
+            eval_key = f"evalCustomFunctions::{id(self)}"
+            CUSTOM_EVALS[eval_key] = _graph_scoped_eval(weakref.ref(self))
+            weakref.finalize(self, CUSTOM_EVALS.pop, eval_key, None)
+
+        # Cache of prepared queries, keyed by (query string, graph namespaces): parsing a
+        # SPARQL query with RDFLib is slow, and endpoints typically see repeated queries.
+        self._prepared_queries: OrderedDict[Tuple[str, frozenset], Any] = OrderedDict()
 
         self.prepare_sd_graph()
 
@@ -150,7 +182,7 @@ class SparqlRouter(APIRouter):
 
             if query:
                 try:
-                    parsed_query = prepareQuery(query, initNs=graph_ns)
+                    parsed_query = self._prepare_query_cached(query, graph_ns)
                     query_results = self.graph.query(parsed_query, processor=self.processor)
 
                     query_operation = re.sub(r"(\w)([A-Z])", r"\1 \2", parsed_query.algebra.name)
@@ -293,6 +325,23 @@ class SparqlRouter(APIRouter):
         #     """Handle HEAD requests to check endpoint availability."""
         #     return Response(status_code=200, headers={"Allow": "GET, POST, HEAD"})
 
+    def _prepare_query_cached(self, query: str, graph_ns: Dict[str, Any]) -> Any:
+        """Prepare a SPARQL query, reusing the parsed query for repeated requests.
+
+        The cache key includes the graph namespaces since they are used as initNs
+        (they can change when update queries add prefixes).
+        """
+        key = (query, frozenset((prefix, str(ns)) for prefix, ns in graph_ns.items()))
+        cached = self._prepared_queries.get(key)
+        if cached is not None:
+            self._prepared_queries.move_to_end(key)
+            return cached
+        prepared = prepareQuery(query, initNs=graph_ns)
+        self._prepared_queries[key] = prepared
+        if len(self._prepared_queries) > 128:
+            self._prepared_queries.popitem(last=False)
+        return prepared
+
     def _build_example_queries_from_dataset(self, dataset: DatasetExt) -> Optional[Dict[str, QueryExample]]:
         """Extract example queries from DatasetExt custom function docstrings."""
         examples: Dict[str, QueryExample] = {}
@@ -316,6 +365,12 @@ class SparqlRouter(APIRouter):
         """
         # This part holds basic implementation for adding new functions
         if part.name == "Extend":
+            # Only claim function IRIs registered on this endpoint. Otherwise raise
+            # NotImplementedError so the part falls through to other custom evals (e.g.
+            # DatasetExt functions): this handler lives in the process-global CUSTOM_EVALS
+            # registry, so it must not swallow IRIs it does not own.
+            if hasattr(part.expr, "iri") and not any(part.expr.iri == URIRef(uri) for uri in self.functions):
+                raise NotImplementedError()
             query_results: List[Any] = []
             # Information is retrieved and stored and passed through a generator
             for eval_part in evalPart(ctx, part.p):
@@ -383,7 +438,7 @@ class SparqlRouter(APIRouter):
         if (
             isinstance(self.graph, Dataset)
             and getattr(self.graph, "default_union", False)
-            and not any(self.service_description.triples((sd_subj, SD.feature, SD.BasicFederatedQuery)))
+            and not any(self.service_description.triples((sd_subj, SD.feature, SD.UnionDefaultGraph)))
         ):
             self.service_description.add((sd_subj, SD.feature, SD.UnionDefaultGraph))
         if not any(self.service_description.triples((sd_subj, SD.feature, SD.BasicFederatedQuery))):
@@ -434,8 +489,10 @@ class SparqlRouter(APIRouter):
 
             # Add named graphs to the dataset
             if isinstance(self.graph, Dataset):
-                # Get the list of distinct graph names with a SPARQL query
-                results: Any = self.graph.query("SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }")
+                # Get all named graphs and their triple counts in a single SPARQL query
+                results: Any = self.graph.query(
+                    "SELECT ?g (COUNT(*) AS ?count) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g"
+                )
 
                 for row in results:
                     named_graph_node = BNode()
@@ -451,22 +508,21 @@ class SparqlRouter(APIRouter):
                     # Add graph metadata
                     self.service_description.add((named_graph_node, SD.graph, graph_node))
                     self.service_description.add((graph_node, RDF.type, SD.Graph))
+                    # row.count would resolve to tuple.count, so access the variable by name
+                    self.service_description.add(
+                        (graph_node, URIRef("http://rdfs.org/ns/void#triples"), row["count"] or Literal(0))
+                    )
 
-                    # Count triples in the named graph and add it to the description
-                    triple_count_query = f"SELECT (COUNT(*) AS ?count) WHERE {{ GRAPH <{row.g}> {{ ?s ?p ?o }} }}"
-                    count_result: Any = self.graph.query(triple_count_query)
-                    triple_count = next(iter(count_result), [Literal(0)])[0]
-                    # result_row: Any = next(iter(count_result), None)
-                    # triple_count = result_row.count if result_row else Literal(0)
-                    self.service_description.add((graph_node, URIRef("http://rdfs.org/ns/void#triples"), triple_count))
-
-        # Add custom functions to the service description
-        for custom_function_uri in [
-            key
-            for key in CUSTOM_EVALS
-            if key.startswith("urn:") or key.startswith("https://") or key.startswith("http://")
-        ]:
-            function_uri = URIRef(custom_function_uri)
+        # Add custom functions to the service description.
+        # Functions decorated on a DatasetExt are scoped per-instance (not keyed by IRI in
+        # CUSTOM_EVALS), so read them from the dataset; also keep scanning CUSTOM_EVALS for
+        # IRI-keyed entries registered manually (the legacy rdflib customEval pattern).
+        function_uris: List[URIRef] = [
+            URIRef(key) for key in CUSTOM_EVALS if key.startswith(("urn:", "https://", "http://"))
+        ]
+        if isinstance(self.graph, DatasetExt):
+            function_uris.extend(self.graph.get_extension_function_iris())
+        for function_uri in function_uris:
             if (function_uri, RDF.type, SD.Function) not in self.service_description:
                 self.service_description.add((function_uri, RDF.type, SD.Function))
             if (sd_subj, SD.extensionFunction, function_uri) not in self.service_description:
