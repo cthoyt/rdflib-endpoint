@@ -277,10 +277,12 @@ def test_legacy_functions_are_scoped_to_router_graph():
     """
     graph_a = Graph()
     graph_b = Graph()
-    SparqlEndpoint(graph=graph_a, functions={"urn:test:scopedConcat": custom_concat})
-    SparqlEndpoint(graph=graph_b)
+    endpoint_a = SparqlEndpoint(graph=graph_a, functions={"urn:test:scopedConcat": custom_concat})
+    endpoint_b = SparqlEndpoint(graph=graph_b)
 
     query = 'SELECT ?concat WHERE { BIND(<urn:test:scopedConcat>("a", "b") AS ?concat) }'
     assert [str(row[0]) for row in graph_a.query(query)] == ["ab", "ba"]
     # graph_b never registered the function, so it must resolve to nothing
     assert list(graph_b.query(query)) == []
+    # Keep both endpoints referenced until every query has run
+    assert endpoint_a is not None and endpoint_b is not None
