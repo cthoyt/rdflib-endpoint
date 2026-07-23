@@ -65,6 +65,12 @@ The code will be automatically formatted when you commit your changes using `pre
 
 ### ♻️ Reset the environment
 
+Upgrade dependencies in lock file:
+
+```sh
+uv sync --all-extras --upgrade
+```
+
 Upgrade `uv`:
 
 ```sh
