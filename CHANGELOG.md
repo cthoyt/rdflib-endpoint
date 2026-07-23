@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.3](https://github.com/vemonet/rdflib-endpoint/compare/v0.6.2..v0.6.3) - 2026-07-23
+
+### 🐛 Bug Fixes
+
+- Issue where rdflib assign global custom functions, we scope custom functions defined through decorators at the `DatasetExt` level - ([3f3612c](https://github.com/vemonet/rdflib-endpoint/commit/3f3612c562deeb40fc418537333b4305c8f4abd7))
+
+### 🛠️ Miscellaneous Tasks
+
+- Upgrade deps - ([e69a067](https://github.com/vemonet/rdflib-endpoint/commit/e69a06755c2406fe3792846a556a615377adc890))
+
+### 🧪 Testing
+
+- Fix - ([22529b1](https://github.com/vemonet/rdflib-endpoint/commit/22529b182586c9eabd3345935b9191dd882dba70))
+
 ## [0.6.2](https://github.com/vemonet/rdflib-endpoint/compare/v0.6.1..v0.6.2) - 2026-06-04
 
 ### ⚙️ Continuous Integration
@@ -17,6 +31,7 @@ All notable changes to this project will be documented in this file.
 
 - Clean up unused dev dependencies, and improve docs for tests using docker - ([f2078e6](https://github.com/vemonet/rdflib-endpoint/commit/f2078e67eebcd76115c0ddbfd8ce725e3e3f6bfe))
 - Update tests dependencies - ([0e5b667](https://github.com/vemonet/rdflib-endpoint/commit/0e5b6677827c2f7afb5ccc9cba470503d16291e2))
+- Bump to v0.6.2 - ([893954b](https://github.com/vemonet/rdflib-endpoint/commit/893954b85fb8c80aed1879d28ff81728752f171c))
 
 ### 🧪 Testing
 
